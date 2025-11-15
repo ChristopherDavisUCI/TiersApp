@@ -9,6 +9,7 @@ from ev_utils import (
     compute_team_scores,
     compute_ev_against_field,
     compute_bundle_ev,
+    compute_bundle_ev_marginal,
 )
 from optimals_utils import simulate_optimals
 
@@ -17,7 +18,7 @@ from optimals_utils import simulate_optimals
 st.set_page_config(page_title="Editable Projections and Ownership", layout="wide")
 st.title("Editable Projections and Ownership Grid")
 
-st.write("Most of this was written by ChatGPT.")
+st.write("Most of this was written by ChatGPT.  Thanks to them, but also beware of possible large misunderstandings.")
 
 DATA_PATH = os.path.join("data", "splash_tiers_week11.csv")
 
@@ -57,6 +58,8 @@ if "df" not in st.session_state:
 # --- Editable grid ---
 st.subheader("Edit Projections and Ownership")
 
+st.write('''Projections come from Splash.  Standard deviation is calculated as half of the projection.  Ownership is set as uniform within a tier.  Any of these can be editted.  (Click Calculate Ownership to fill in missing values if you make changes.)''')
+
 edited_df = st.data_editor(
     st.session_state.df,
     column_config={
@@ -90,6 +93,8 @@ st.download_button(
 # --- Simulation controls ---
 st.subheader("Simulations")
 
+st.write("We simulate player scores using the projections above, assuming a normal distribution.  There is no 'stacking' correlation here, everything is independent.")
+
 num_sims = st.number_input(
     "Number of simulations to run",
     min_value=1,
@@ -107,6 +112,8 @@ if st.button("Run Simulations"):
 
 # --- Generate Field controls ---
 st.subheader("Generate Field")
+
+st.write("Select a field of opponents using the ownership projections.  Better to have too large of a field, since we're not assuming any logic in how the teams are constructed.")
 
 num_teams = st.number_input(
     "Number of teams to generate",
@@ -139,7 +146,7 @@ if st.button("Generate Field"):
 # --- Simulate Optimals ---
 st.subheader("Simulate Optimals")
 
-st.write("For a fixed sim, the only variation here is in Tier 8.")
+st.write("We find the best possible team for each of our simulation runs.  In fact, we find multiple best teams for each simulation, but for a fixed sim, the only variation is in Tier 8.  (This speeds up the computation a lot.)")
 
 top_k = st.number_input(
     "Number of best teams per simulation",
@@ -174,6 +181,8 @@ if st.button("Simulate Optimals"):
         )
 
 st.subheader("Compute EVs (vs Field)")
+
+st.write("For our optimals above, we see how they would do against the field, and choose the top performing teams.")
 
 top_n = st.number_input(
     "Show top N optimals by EV",
@@ -311,61 +320,81 @@ st.subheader("Find next top teams")
 
 st.write("Finds best teams, taking into account your current locked lineups.")
 
-if st.button("Recompute top teams"):
-    
-    # Checks
+# --- Find next top teams (marginal bundle EV version) ---
+if st.button("Recompute top teams", key="recompute_top_teams"):
+
     req = ["field_scores", "optimals_scores", "optimals", "df", "sims"]
     if not all(k in st.session_state for k in req):
         st.error("Please run simulations, generate field, and compute EVs first.")
     else:
         import os, pandas as pd
+        from ev_utils import compute_bundle_ev_marginal
 
         df_players     = st.session_state.df
         sims           = st.session_state.sims
         field_scores   = st.session_state.field_scores        # (F, S)
         optimals_df    = st.session_state.optimals            # teams T1..T8
         optimals_scores= st.session_state.optimals_scores     # (O, S)
+        payouts_df     = pd.read_csv(os.path.join("data", "payouts_11.csv"))
 
-        payouts_df = pd.read_csv(os.path.join("data", "payouts_11.csv"))
-
-        # Build team_id for all optimals
-        player_cols = [c for c in optimals_df.columns if c.startswith("T")]
+        # ---- Identify locked and candidate teams ----
+        player_cols = [c for c in optimals_df.columns if c.startswith("T") and c[1:].isdigit()]
         team_ids_all = (
             optimals_df[player_cols]
-            .fillna("")            # replace NaN
-            .astype(str)           # ensure all strings
+            .fillna("")
+            .astype(str)
             .agg(" | ".join, axis=1)
         )
 
-        # Locked subset
-        locked_ids = set(st.session_state.get("locked_team_ids", []))
-        locked_mask = team_ids_all.isin(locked_ids)
-        locked_scores = optimals_scores[locked_mask.values, :] if locked_mask.any() else np.zeros((0, sims.shape[1]))
+        locked_ids   = set(st.session_state.get("locked_team_ids", []))
+        locked_mask  = team_ids_all.isin(locked_ids)
+        locked_scores = (
+            optimals_scores[locked_mask.values, :]
+            if locked_mask.any() else np.zeros((0, sims.shape[1]))
+        )
 
-        # Candidates = optimals not locked
-        cand_mask = ~locked_mask
-        cand_df = optimals_df[cand_mask].reset_index(drop=True)
+        cand_mask  = ~locked_mask
+        cand_df    = optimals_df[cand_mask].reset_index(drop=True)
         cand_scores = optimals_scores[cand_mask.values, :]
 
-        # Compute bundle EV for candidates
-        bundle_ev = compute_bundle_ev(
+        # ---- Compute absolute & marginal EVs for each candidate ----
+        bundle_abs, bundle_marginal = compute_bundle_ev_marginal(
             locked_scores=locked_scores,
             candidate_scores=cand_scores,
             field_scores=field_scores,
-            payouts_df=payouts_df
+            payouts_df=payouts_df,
         )
 
         cand_out = cand_df.copy()
-        cand_out["BundleEV"] = bundle_ev
-        # Show new Top-N (same control top_n as above)
-        top_bundle = cand_out.sort_values("BundleEV", ascending=False).head(top_n)
-        st.session_state.top_bundle = top_bundle
+        cand_out["BundleEV"]   = bundle_abs
+        cand_out["MarginalEV"] = bundle_marginal
 
-        st.success(f"Bundle EV computed for {len(cand_out):,} candidates. Showing top {top_n}.")
+        # ---- Exclude already locked teams (safety) ----
+        cand_out = cand_out.assign(
+            team_id=cand_out[player_cols]
+                .fillna("")
+                .astype(str)
+                .agg(" | ".join, axis=1)
+        )
+        cand_out = cand_out[~cand_out["team_id"].isin(locked_ids)]
+
+        # ---- Sort by marginal EV (the key improvement) ----
+        top_bundle = cand_out.sort_values("MarginalEV", ascending=False).head(top_n)
+
+        # ---- Update session state ----
+        st.session_state.top_bundle    = top_bundle
+        st.session_state.optimals_top  = top_bundle   # keep Lock-Teams picker synced
+
+        # ---- Display results ----
+        st.success(f"Next top teams computed by *marginal* EV (excluding locked).")
         st.dataframe(top_bundle, use_container_width=True)
-        # Update top list for the Lock Teams section to use the new bundle results
-        st.session_state.optimals_top = top_bundle
 
-        # Optional download
+        # ---- Optional download ----
         csv_bundle = top_bundle.to_csv(index=False).encode("utf-8")
-        st.download_button("Download top bundle EV teams", csv_bundle, "bundle_ev_top.csv", "text/csv")
+        st.download_button(
+            "Download top-EV teams",
+            csv_bundle,
+            "top_marginal_ev.csv",
+            "text/csv",
+            key="download_top_marginal_ev",
+        )

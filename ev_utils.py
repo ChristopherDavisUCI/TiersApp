@@ -186,3 +186,76 @@ def compute_bundle_ev(
             payouts[:, j] = 0.0
 
     return payouts.mean(axis=1)  # (C,)
+
+
+def compute_bundle_ev_marginal(
+    locked_scores: np.ndarray,    # (L, S) possibly L=0
+    candidate_scores: np.ndarray, # (C, S)
+    field_scores: np.ndarray,     # (F, S)
+    payouts_df: pd.DataFrame
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Returns (bundle_ev_abs, bundle_ev_marginal) for each candidate.
+
+    - bundle_ev_abs: absolute bundle EV = E[max(payout_locked, payout_candidate)]
+    - bundle_ev_marginal: incremental EV over locked bundle = E[max(...) - payout_locked]
+
+    Places are always computed relative to FIELD (opponents).
+    """
+    # Build place->payout LUT
+    payout_map = payouts_df.set_index("place")["payout"].to_dict()
+    max_place = int(payouts_df["place"].max()) if len(payouts_df) else 0
+    lut = np.zeros(max_place + 1, dtype=float)
+    for pl, pay in payout_map.items():
+        if pl <= max_place:
+            lut[pl] = float(pay)
+
+    # Prepare sorted field per sim (descending) via negatives (ascending)
+    F, S = field_scores.shape
+    field_sorted_neg = np.sort(-field_scores, axis=0)  # ascending negatives
+
+    def places_vs_field(scores: np.ndarray) -> np.ndarray:
+        # scores: (K, S)
+        K = scores.shape[0]
+        places = np.empty((K, S), dtype=np.int32)
+        for j in range(S):
+            # place = #field with strictly greater score + 1
+            places[:, j] = np.searchsorted(field_sorted_neg[:, j], -scores[:, j], side="left") + 1
+        return places
+
+    # Locked payout per sim (vector length S)
+    if locked_scores.size == 0:
+        payout_locked = np.zeros((1, S), dtype=float)  # effectively all zeros
+        min_locked_place = None
+    else:
+        locked_places = places_vs_field(locked_scores)           # (L, S)
+        best_locked_places = locked_places.min(axis=0)           # (S,)
+        # Map to payout (places > max_place -> 0)
+        payout_locked = np.zeros(S, dtype=float)
+        mask = best_locked_places <= max_place
+        payout_locked[mask] = lut[best_locked_places[mask]]
+
+    # Candidate payouts
+    cand_places = places_vs_field(candidate_scores)              # (C, S)
+    C = cand_places.shape[0]
+    payout_cand = np.zeros_like(cand_places, dtype=float)        # (C, S)
+    if max_place > 0:
+        for j in range(S):
+            col = cand_places[:, j]
+            m = col <= max_place
+            if m.any():
+                payout_cand[m, j] = lut[col[m]]
+
+    # Absolute bundle EV: E[ max(payout_locked, payout_candidate) ]
+    if locked_scores.size == 0:
+        bundle_abs = payout_cand.mean(axis=1)
+        bundle_marginal = bundle_abs.copy()  # when no locks, marginal == absolute
+    else:
+        # Broadcast payout_locked (S,) against (C,S)
+        better = np.maximum(payout_cand, payout_locked[None, :])
+        bundle_abs = better.mean(axis=1)
+        # Marginal EV: E[max(...) - payout_locked]
+        incr = better - payout_locked[None, :]
+        bundle_marginal = incr.mean(axis=1)
+
+    return bundle_abs, bundle_marginal
